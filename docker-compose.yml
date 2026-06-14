@@ -1,0 +1,137 @@
+# =============================================================================
+#  n8n self-hosted  —  stack independiente (convive con tu Odoo existente)
+#  Servicios: n8n + postgres-n8n + redis-n8n
+#  Versión de n8n FIJADA (no usar :latest) para controlar cuándo actualizas.
+# =============================================================================
+#
+#  Antes de levantar:
+#   1. Copia este archivo a tu servidor (p.ej. /opt/n8n/docker-compose.yml)
+#   2. Crea un archivo .env junto a él (ver plantilla al final de este archivo)
+#   3. docker compose up -d
+#
+#  IMPORTANTE: este stack NO toca tu Odoo. Usa su propia red, sus propios
+#  volúmenes y su propio contenedor de Postgres. Puede correr en la misma
+#  máquina sin interferir.
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Postgres dedicado a n8n (separado del Postgres de Odoo a propósito)
+  # ---------------------------------------------------------------------------
+  postgres-n8n:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_n8n_data:/var/lib/postgresql/data
+    networks:
+      - n8n_internal
+    # Sin 'ports': la BD NO se expone al host ni a internet.
+    # Solo es accesible por otros contenedores de la red n8n_internal.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Redis dedicado a n8n (buffer de mensajes del workflow)
+  # ---------------------------------------------------------------------------
+  redis-n8n:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # appendonly activa persistencia AOF. Para tu buffer efímero podrías
+    # quitarlo, pero dejarlo evita perder buffers en un reinicio inesperado.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_n8n_data:/data
+    networks:
+      - n8n_internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # n8n  —  VERSIÓN FIJADA. Cambia el tag SOLO tras probar en staging.
+  # ---------------------------------------------------------------------------
+  n8n:
+    image: n8nio/n8n:2.25.7      # <-- versión fijada (NO usar :latest)
+    restart: unless-stopped
+    depends_on:
+      postgres-n8n:
+        condition: service_healthy
+      redis-n8n:
+        condition: service_healthy
+    environment:
+      # --- Base de datos ---
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres-n8n
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+
+      # --- Redis (cola/buffer) ---
+      QUEUE_BULL_REDIS_HOST: redis-n8n
+      QUEUE_BULL_REDIS_PORT: 6379
+
+      # --- URL pública / webhooks ---
+      # Debe coincidir con el dominio que apunta tu reverse proxy a n8n.
+      # Es la URL que registrarás en YCloud como webhook.
+      N8N_HOST: ${N8N_HOST}
+      N8N_PROTOCOL: https
+      N8N_PORT: 5678
+      WEBHOOK_URL: https://${N8N_HOST}/
+      N8N_EDITOR_BASE_URL: https://${N8N_HOST}/
+
+      # --- Seguridad ---
+      # Clave para cifrar credenciales. GENERAR UNA VEZ y NO cambiarla nunca
+      # (si la cambias, n8n no puede descifrar credenciales existentes).
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      # Login básico del editor (o usa la gestión de usuarios de n8n).
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
+
+      # --- Zona horaria ---
+      GENERIC_TIMEZONE: Europe/Madrid
+      TZ: Europe/Madrid
+
+      # --- Ejecuciones: limpieza automática para no inflar la BD ---
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: "336"   # horas (14 días)
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - n8n_internal
+      - web            # red del reverse proxy (ver nota abajo)
+    ports:
+      # Expón n8n SOLO si NO usas reverse proxy. Lo recomendable es
+      # comentar esta línea y publicar n8n vía Traefik/Nginx con TLS.
+      - "127.0.0.1:5678:5678"
+
+# -----------------------------------------------------------------------------
+# Volúmenes nombrados (los datos persisten aunque recrees los contenedores)
+# -----------------------------------------------------------------------------
+volumes:
+  postgres_n8n_data:
+  redis_n8n_data:
+  n8n_data:
+
+# -----------------------------------------------------------------------------
+# Redes
+#   n8n_internal: privada, solo para que n8n hable con su BD y Redis.
+#   web:          red externa de tu reverse proxy (Traefik/Nginx).
+#                 Si ya tienes una red de proxy para Odoo, reutilízala aquí
+#                 marcándola como 'external: true' con su nombre real.
+# -----------------------------------------------------------------------------
+networks:
+  n8n_internal:
+    driver: bridge
+  web:
+    external: true   # cámbialo a una red existente, o créala: docker network create web
